@@ -38,18 +38,61 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf 'board-skills: %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# This script is also reachable as /usr/bin/board-skills (a symlink into
+# /usr/share/pi-skills/scripts), so its own directory has to be resolved through
+# the link before anything next to it can be found.
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+SCRIPT_DIR=$(dirname "$SELF")
+
 local_version() {
-    if [ -r "$USER_CHECKOUT/VERSION" ]; then
-        tr -d ' \n' < "$USER_CHECKOUT/VERSION"
-    elif [ -r "$SYSTEM_SNAPSHOT/VERSION" ]; then
-        tr -d ' \n' < "$SYSTEM_SNAPSHOT/VERSION"
-    else
-        echo unknown
+    # Version of the layer that is actually in use, not of any checkout that
+    # happens to exist: reporting a stale ~/.pi/agent/pi-skills while the links
+    # point at the firmware copy is exactly the kind of mismatch that makes the
+    # updater offer "updates" forever.
+    local root v
+    root=$(active_root)
+    if [ -n "$root" ] && [ -r "$root/VERSION" ]; then
+        v=$(tr -d ' \n' < "$root/VERSION")
+        [ -n "$v" ] && { printf '%s\n' "$v"; return; }
     fi
+    echo unknown
+}
+
+version_gt() {
+    # 0 when $1 is strictly newer than $2, so `version_gt A B || return 1`
+    # reads as "A is not newer than B". Non-numeric parts fall back to plain
+    # inequality, which is what the caller already established.
+    [ "$1" = "$2" ] && return 1
+    local IFS=.
+    # shellcheck disable=SC2206
+    local a=($1) b=($2) i x y
+    for i in 0 1 2 3; do
+        x=${a[$i]:-0} y=${b[$i]:-0}
+        case "$x$y" in
+            *[!0-9]*) return 0 ;;
+        esac
+        [ "$x" -gt "$y" ] && return 0
+        [ "$x" -lt "$y" ] && return 1
+    done
+    return 1
 }
 
 active_root() {
-    # The user checkout wins when it exists: it is the newer one by definition.
+    # The user checkout only wins when it is *newer* than what the firmware
+    # shipped. A reflash installs a newer snapshot, and a stale checkout left in
+    # $HOME from an earlier update must not shadow it -- otherwise the board
+    # keeps running the old skills (and keeps offering to "update" nowhere).
+    local sys_v user_v
+    if [ -d "$USER_CHECKOUT/skills" ] && [ -d "$SYSTEM_SNAPSHOT/skills" ]; then
+        sys_v=$(tr -d ' \n' < "$SYSTEM_SNAPSHOT/VERSION" 2>/dev/null || echo unknown)
+        user_v=$(tr -d ' \n' < "$USER_CHECKOUT/VERSION" 2>/dev/null || echo unknown)
+        if version_gt "$user_v" "$sys_v"; then
+            echo "$USER_CHECKOUT"
+        else
+            echo "$SYSTEM_SNAPSHOT"
+        fi
+        return
+    fi
     if [ -d "$USER_CHECKOUT/skills" ]; then
         echo "$USER_CHECKOUT"
     elif [ -d "$SYSTEM_SNAPSHOT/skills" ]; then
@@ -154,26 +197,6 @@ except Exception:
     printf '%s\n' "$out"
 }
 
-version_gt() {
-    # "1.2.10" > "1.2.9". Returns 0 when $1 is newer than $2.
-    [ "$1" = "$2" ] && return 1
-    local IFS=.
-    # shellcheck disable=SC2206
-    local a=($1) b=($2) i
-    for i in 0 1 2 3; do
-        local x=${a[$i]:-0} y=${b[$i]:-0}
-        case "$x$y" in
-            *[!0-9]*)
-                # Not numeric somewhere: fall back to a plain inequality, which
-                # the caller already established.
-                return 0 ;;
-        esac
-        [ "$x" -gt "$y" ] && return 0
-        [ "$x" -lt "$y" ] && return 1
-    done
-    return 1
-}
-
 needs_update() {
     # 0 = yes, 1 = no, 2 = cannot tell (offline)
     local local_v remote_v
@@ -238,8 +261,8 @@ do_prompt() {
 
     # A GUI dialog when there is a desktop session, a terminal question when
     # there is a tty, silence otherwise (cron, systemd, no session yet).
-    if have python3 && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
-        if python3 "$(dirname "$0")/board-skills-prompt.py" "$local_v" "$remote_v" 2>/dev/null; then
+    if have python3 && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}${XDG_SESSION_TYPE:-}" ]; then
+        if python3 "$SCRIPT_DIR/board-skills-prompt.py" "$local_v" "$remote_v" 2>/dev/null; then
             do_update
             exit $?
         fi
@@ -304,7 +327,7 @@ case "${1:-status}" in
         esac
         ;;
     -h|--help|help)
-        sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,26p' "$SELF" | sed 's/^# \{0,1\}//'
         ;;
     *)
         warn "unknown command $1 (try: status sync check update autostart dismiss)"
