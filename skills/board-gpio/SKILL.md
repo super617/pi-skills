@@ -49,59 +49,147 @@ sudo head -20 /sys/kernel/debug/gpio     # ★ 唯一能看到「chip → 物理
 
 **40Pin 上的引脚用 `gpiochip4`**，编号是 TLMM 的 offset（如 GPIO_36 = chip4 的 line 36）。
 
-### 2.1 用 rgs（推荐，官方带的 lgpio 命令行）
+debugfs 里 gpiochip4 的行带 func 和驱动能力（TLMM 特有，PMIC 的 chip 没有）：
 
-板上 `dpkg -l lgpio` 是 `1.0-r0`，装的是 `rgs` + `rgpiod`。
-`rgs` 是一个**交互式命令行**，不是一条命令干一件事。
-
-```bash
-rgs            # 进入交互，或者用 -h
-rgs -h         # 看帮助（有输出，别用 rgs help，会报 unknown command）
+```
+ gpio0   : in  high func1 2mA no pull
+ gpio2   : out high func0 16mA no pull
+                 ↑方向 ↑电平 ↑功能号 ↑驱动电流 ↑上下拉
 ```
 
-实测帮助里可用的命令（`h` 是句柄，`g` 是 gpio 号）：
-
-| 命令 | 作用 |
-|---|---|
-| `help` | 打印帮助 |
-| `GC h` | 关闭 gpiochip |
-| `GIC h` | gpiochip 信息（行数、label） |
-| `GIL h g` | 该 line 的信息 |
-| `GGR h g` | 读组 |
-| `GGW h g gbits` | 写组 |
-| `GDEB h g us` | 设置去抖 |
-
-> ⚠️ 实际动手前先 `rgs -h` 看当前固件支持哪些子命令，不同 lgpio 版本命令集不同。
-> 更稳的路线是 §2.2 的 Python 或 C。
-
-### 2.2 Python（python-periphery，最省事）
+### 2.0 先看权限：这些设备**全只有 root 能开**
 
 ```bash
-# 需要先装（板上没有预装）
-apt list --installed 2>/dev/null | grep -i periphery
-sudo apt install -y python3-periphery      # 或 pip3 install python-periphery --break-system-packages
+ls -l /dev/i2c-* /dev/gpiochip* /dev/spidev*
+```
+
+实测全都是 `crw------- 1 root root`。桌面用户 `p` 的组只有
+`sudo audio video users input`（**不在 `dialout`，也不在 `gpio`/`i2c`**），所以：
+
+```
+sudo -u p python3 -c 'open("/dev/i2c-9","rb")'
+  → PermissionError: [Errno 13] Permission denied
+sudo -u p python3 -c 'open("/dev/spidev10.0","rb")'
+  → PermissionError: [Errno 13] Permission denied
+sudo -u p python3 -c 'open("/dev/gpiochip4","rb")'
+  → PermissionError: [Errno 13] Permission denied
+```
+
+| 设备 | 权限 | `p` 能用吗 | 备注 |
+|---|---|---|---|
+| `/dev/i2c-N` | `root:root 600` | ✗ | **全部总线**，不只 i2c9 |
+| `/dev/gpiochipN` | `root:root 600` | ✗ | 全部 6 个 |
+| `/dev/spidev10.x` | `root:root 600` | ✗ | |
+| `/dev/ttyHS2`（UART12） | `root:dialout 660` | ✗ | `p` **不在 dialout**，实测 `cat: Permission denied` |
+| `/sys/kernel/debug/gpio` | 需 root | ✗ | 只读也要 sudo |
+
+→ **本节下面所有命令都默认带 `sudo`**。不想每条都 sudo，就加一条 udev 规则
+（属改系统配置，先问用户）：
+
+```bash
+# /etc/udev/rules.d/60-gpio-i2c.rules
+SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-*", GROUP="i2c", MODE="0660"
+```
+
+### 2.1 先把结论说清楚：`rgs` 在这块板上用不了
+
+板上确实装了 `lgpio 1.0-r0`（含 `/usr/bin/rgs`、`/usr/bin/rgpiod`），
+`rgpiod.service` 也是 active（只监听 `127.0.0.1:8889`）。**但实测所有实际操作都失败**：
+
+```bash
+rgs -h                          # 帮助能打（rc=0）
+rgs u t1 share 1 go 4           # 打开 gpiochip4 → 返回句柄，OK
+rgs u t1 gic <handle>           # Error: no permission to perform action  (-93)
+rgs u t1 gil <handle> 36        # 同  -93
+rgs u t1 gr  <handle> 36        # 同  -93
+rgs u t1 gso <handle> 36        # 同  -93
+```
+
+| 验证项 | 结果 |
+|---|---|
+| root 跑 | -93 EPERM |
+| 桌面用户 `p` 跑 | -93 EPERM |
+| `gpiochip0`(PMIC) / `gpiochip4`(TLMM) | 都是 -93 |
+| 往 `/permits` 放 `*: *` 等放宽规则后 `rgs lcfg` | 仍 -93 |
+
+→ **`rgs` 的 daemon 路径（rgpiod）在这份镜像上不可用**，不是权限配错几行就能救的。
+不要把它当推荐方案，也不要因为 `/permits` 不存在就去改系统配置。
+
+另外帮助文本里有两个坑：示例写的 `s 1` 会报 `bad parameter`，要写 **`share 1`**；
+`rgs help` 会报 `unknown command`，要看帮助用 `rgs -h`。
+
+### 2.2 能用的路：lgpio 本地直连（不经 daemon）
+
+`rgs` 走 daemon，而 lgpio 的库函数是**直接打开 `/dev/gpiochipN`**，这条路是好的。
+板上没有 `lgpio.h`，也没有 `liblgpio.so` 软链，所以编译要两条都绕过：
+
+```c
+/* gpio_read.c -- 自声明原型，板内无 lgpio.h */
+#include <stdio.h>
+#include <string.h>
+int lgGpiochipOpen(int chip);
+int lgGpiochipClose(int h);
+int lgGpioRead(int h, int gpio);
+int lgGpioGetMode(int h, int gpio);
+int lgGpioClaimOutput(int h, int flags, int gpio, int level);
+int lgGpioWrite(int h, int gpio, int level);
+int lgGpioFree(int h, int gpio);
+
+int main(void) {
+    int h = lgGpiochipOpen(4);            /* TLMM */
+    if (h < 0) { printf("open: %s\n", strerror(-h)); return 1; }
+    printf("gpio36 mode=%d level=%d\n", lgGpioGetMode(h, 36), lgGpioRead(h, 36));
+
+    /* 输出：先 claim 再 write（会真的拉电平，动手前想好看什么） */
+    if (lgGpioClaimOutput(h, 0, 78, 0) == 0) {   /* 78 = 40Pin pin33 */
+        lgGpioWrite(h, 78, 1);
+        lgGpioWrite(h, 78, 0);
+        lgGpioFree(h, 78);
+    }
+    lgGpiochipClose(h);
+    return 0;
+}
+```
+
+```bash
+gcc gpio_read.c -o gpio_read -l:liblgpio.so.1   # 注意是全名，-llgpio 会找不到
+./gpio_read
+```
+
+实测输出（2026-11-13，只读，没有拉电平）：
+
+```
+lgGpiochipOpen(4) -> 0
+gpio36  GetMode -> 65536  read -> 1      ← 65536 = LG_SET_INPUT (0x10000)
+gpio37  GetMode -> 65536  read -> 1
+gpio38  GetMode -> 65536  read -> 0
+close -> 0
+```
+
+→ **读写都可用**。`GetMode` 返的是位掩码，`0x10000` = 输入模式。
+
+> 板上 `liblgpio.so.1` 存在但**没有** `liblgpio.so` 开发软链，也没有头文件。
+> 想要头文件和 `-llgpio`：`sudo apt install liblgpio-dev`（装前问用户）。
+
+### 2.3 Python：periphery / lgpio 模块都得先装
+
+板上 `python3-periphery`、`lgpio`(python)、`python3-gpiod` **都没装**：
+
+```bash
+sudo apt install -y python3-periphery       # 或有网时 pip3 install python-periphery --break-system-packages
 ```
 
 ```python
 from periphery import GPIO
-out = GPIO("/dev/gpiochip4", 36, "out")    # pin3 → GPIO36
-out.write(True)                            # 3.3V
-out.close()
+with GPIO("/dev/gpiochip4", 36, "in") as pin:    # pin3 → GPIO36
+    print(pin.read())
+```
+
+不装任何包时的只读方案见 §2.4。
 inp = GPIO("/dev/gpiochip4", 37, "in")     # pin5 → GPIO37
 print(inp.read())
 ```
-
-### 2.3 C（lgpio）
-
-```bash
-# 库在，但**没有开发软链**：只剩 liblgpio.so.1，没有 liblgpio.so
-ls /usr/lib/liblgpio.so*
-# 编译时要显式指全名，或用 -l:liblgpio.so.1
-gcc x.c -o x -l:liblgpio.so.1
-```
-
-`lgGpiochipOpen(4)` 对应 TLMM。头文件不在默认 include 路径，需要自己带
-`lgpio.h`（源码包里）。
 
 ### 2.4 只读：直接看 debugfs（不用装任何工具）
 
@@ -116,39 +204,173 @@ sudo cat /sys/kernel/debug/gpio | grep -A40 'gpiochip4'
 ### 2.5 这块板上没有的东西
 
 ```
-i2cdetect / i2cget / i2cset   ✗ 未安装（apt install i2c-tools）
-gpiodetect / gpioset / gpioget ✗ 未安装（apt install gpiod）
+i2cdetect / i2cget / i2cset    ✗ 未安装（apt install i2c-tools）
+gpiodetect / gpioset / gpioget ✗ 未安装（apt install gpiod / libgpiod-tools）
 python3-gpiod                  ✗ 未安装
+python3-periphery              ✗ 未安装
+lgpio (python 模块)             ✗ 未安装；liblgpio.so.1 有，但无 -dev 无头文件
+rgs / rgpiod                   ✓ 装了、服务在跑，但**所有操作返回 -93**（见 §2.1）
 ```
 
-## 3. I2C9
+## 3. I2C（含 40Pin 的 I2C9）
+
+板上 **没有 i2cdetect/i2cget/i2cset**（没装 i2c-tools），**也没有 python smbus/smbus2**。
+但 `gcc` 和 `/usr/include/linux/i2c*.h` 都在，所以「零安装」也能扫和读。
 
 ```bash
-ls /dev/i2c-9                       # 存在即已使能
-# 没装 i2cdetect 时怎么知道挂了什么：
-ls /sys/bus/i2c/devices/ | grep '^9-'
-for d in /sys/bus/i2c/devices/9-*/name; do echo "$(dirname $d | xargs basename)=$(cat $d)"; done
+ls /dev/i2c-*          # 实测: i2c-0 1 3 9 13 16 17
+# 不看工具，先看内核已经认了什么器件：
+for d in /sys/bus/i2c/devices/*/name; do echo "$(dirname $d | xargs basename)=$(cat $d)"; done
 ```
 
-要让某个器件挂上来（比如 BME280 @0x76）：
+本机实测的已绑定器件：
+
+| 节点 | 器件 | 说明 |
+|---|---|---|
+| `0-002b` | `lt9611uxc` | HDMI 桥变体（未贴） |
+| `0-0041` | `lt9611uxd` | ★ HDMI 桥，实际在用的 |
+| `1-002c` | `emc2303` | 风扇控制器 |
+| `1-0047` | `sgm7220` | Type-C CC 控制器 |
+| `3-0014` | `gt911` | DSI 屏触摸（屏未接） |
+| `3-0045` | `8.0inch-panel` | DSI 屏（未接） |
+| `i2c-16/17` | `dpu_dp_aux` | DP AUX 通道，**不是普通 I2C 总线**，别拿去扫器件 |
+
+### 3.1 零安装扫总线（替代 `i2cdetect`）
+
+用**1 字节读**做探针，不用零长写。这点实测有差别：零长写探针对
+gpio 实测在 `bus0 0x41`（LT9611UXD）**探不到**，而读探针能探到。读操作也不会改器件寄存器。
+
+```c
+/* i2cscan.c -- gcc i2cscan.c -o i2cscan && sudo ./i2cscan 0 */
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
+
+static int probe(int fd, int addr) {
+    unsigned char b = 0;
+    struct i2c_msg m = { .addr = (unsigned short)addr, .flags = I2C_M_RD,
+                         .len = 1, .buf = &b };
+    struct i2c_rdwr_ioctl_data x = { .msgs = &m, .nmsgs = 1 };
+    return ioctl(fd, I2C_RDWR, &x) >= 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) { fprintf(stderr, "usage: %s <bus>\n", argv[0]); return 2; }
+    char path[32];
+    snprintf(path, sizeof path, "/dev/i2c-%d", (int)strtol(argv[1], NULL, 0));
+    int fd = open(path, O_RDWR);
+    if (fd < 0) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
+    printf("bus%s read-probe: ", argv[1]);
+    int n = 0;
+    for (int a = 0x03; a <= 0x77; a++) if (probe(fd, a)) { printf("%02x ", a); n++; }
+    if (!n) printf("(nothing responded)");
+    printf("\n");
+    close(fd);
+    return n ? 0 : 1;
+}
+```
+
+实测输出（2026-11-13，当前硬件）：
+
+```
+bus0 read-probe: 41              ← LT9611UXD（HDMI 桥）
+bus1 read-probe: 47              ← SGM7220（Type-C CC）
+bus3 read-probe: (nothing responded)   ← DSI 屏/触摸未接，正常
+bus9 read-probe: (nothing responded)   ← 40Pin 没插器件
+bus13 read-probe: (nothing responded)
+bus16 read-probe: (nothing responded)
+```
+
+> 一个已知的不对称：`1-002c`(emc2303) 在 sysfs 里有驱动绑定，但通用读探针**不应答**。
+> 所以「探不到」不等于「没这个器件」，还要看 `/sys/bus/i2c/devices/`。
+
+### 3.2 零安装读寄存器（替代 `i2cget`）
+
+```c
+/* i2c_get.c -- gcc i2c_get.c -o i2c_get && sudo ./i2c_get 1 0x47 0x00 */
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s <bus> <addr> <reg>\n", argv[0]);
+        return 2;
+    }
+    int bus = (int)strtol(argv[1], NULL, 0);
+    int addr = (int)strtol(argv[2], NULL, 0);
+    int reg = (int)strtol(argv[3], NULL, 0);
+
+    char path[32];
+    snprintf(path, sizeof path, "/dev/i2c-%d", bus);
+    int fd = open(path, O_RDWR);
+    if (fd < 0) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return 1; }
+
+    unsigned char r = (unsigned char)reg, v = 0;
+    struct i2c_msg m[2] = {
+        { .addr = (unsigned short)addr, .flags = 0,       .len = 1, .buf = &r },
+        { .addr = (unsigned short)addr, .flags = I2C_M_RD, .len = 1, .buf = &v },
+    };
+    struct i2c_rdwr_ioctl_data x = { .msgs = m, .nmsgs = 2 };
+    if (ioctl(fd, I2C_RDWR, &x) < 0) {
+        fprintf(stderr, "read 0x%02x reg 0x%02x on bus%d: %s\n",
+                addr, reg, bus, strerror(errno));
+        close(fd);
+        return 1;
+    }
+    printf("bus%d 0x%02x reg 0x%02x = 0x%02x (%d)\n", bus, addr, reg, v, v);
+    close(fd);
+    return 0;
+}
+```
+
+实测：
+
+```
+$ sudo ./i2c_get 0 0x41 0x00     → bus0 0x41 reg 0x00 = 0x00 (0)      LT9611UXD 应答
+$ sudo ./i2c_get 1 0x47 0x00     → bus1 0x47 reg 0x00 = 0x30 (48)     SGM7220 应答
+$ sudo ./i2c_get 0 0x2b 0x00     → No such device or address          UXC 未贴（预期）
+$ sudo ./i2c_get 3 0x14 0x00     → No such device or address          屏未接（预期）
+```
+
+`ENXIO`/`No such device or address` = 该地址没人应答，不是代码错。
+
+> 不要用 `i2c_smbus_read_byte_data()`：它在 `libi2c`（`i2c/smbus.h`）里，
+> 属于没装的 i2c-tools，编译会报 `implicit declaration`。用上面的 `I2C_RDWR` 纯内核接口。
+
+### 3.3 让一个器件挂上来（运行时实例化，重启失效）
 
 ```bash
-# 方式 A：设备树 overlay（需要在 DTS 里加节点，板端改不了，需重新编译）
-# 方式 B：运行时实例化（重启失效）
+# 以 BME280 @0x76 为例；要对应内核里有驱动才行
 echo bme280 0x76 | sudo tee /sys/bus/i2c/devices/i2c-9/new_device
+dmesg | tail -5                       # 看 probe 结果
+ls /sys/bus/i2c/devices/9-0076/
 # 删掉
 echo 0x76 | sudo tee /sys/bus/i2c/devices/i2c-9/delete_device
 ```
 
-装 i2c-tools 后：
+永久生效要改设备树（板端改不了，得重编内核）。
+
+### 3.4 想装标准工具
 
 ```bash
-sudo apt install -y i2c-tools
-sudo i2cdetect -y -r 9
+sudo apt install -y i2c-tools && sudo i2cdetect -y -r 9
 ```
 
-> 板上默认没有外网限制问题：`apt-get -s install i2c-tools` 实测能解析包，
-> 且 `curl http://deb.debian.org/debian/` 返回 200。装工具前先问用户。
+实测能装：`apt-get -s install i2c-tools` 能解析到 `i2c-tools 4.4-2`，
+`curl http://deb.debian.org/debian/` 返回 200。**装包前先问用户。**
 
 ## 4. SPI10
 
@@ -160,9 +382,9 @@ ls -l /dev/spidev10.0 /dev/spidev10.1
 回环测试（把 MOSI 和 MISO 短接）：
 
 ```bash
-# 板上没有 spidev_test，用 python 最省事
-apt install -y python3-spidev 2>/dev/null || pip3 install spidev --break-system-packages
-python3 - <<'PY'
+# 板上没有 spidev_test，也没装 python3-spidev
+sudo apt install -y python3-spidev    # 装前问用户；装完用下面的脚本
+sudo python3 - <<'PY'
 import spidev
 s = spidev.SpiDev(); s.open(10, 0); s.max_speed_hz = 10_000_000; s.mode = 0
 sent = [0xAA, 0x55, 0x01]
@@ -171,17 +393,28 @@ s.close()
 PY
 ```
 
+不装任何包时的只读检查：确认控制器和片选在内核里就位。
+
+```bash
+ls -l /dev/spidev10.*
+ls /sys/bus/spi/devices/          # 期望有 spi10.0 / spi10.1
+for d in /sys/bus/spi/devices/*; do echo "$(basename $d) -> $(cat $d/uevent 2>/dev/null | tr '\n' ' ')"; done
+```
+
 ## 5. UART12（`/dev/ttyHS2`）
 
 ```bash
 ls -l /dev/ttyHS2                 # crw-rw---- root dialout
-groups | grep dialout             # 桌面用户 p 在 dialout 组里，可直接读写
+id                                # p 的组: sudo audio video users input —— 这里没有 dialout
+# → UART12 也要 sudo，除非自己 usermod -aG dialout p 后重新登录
 ```
 
 回环测试（pin8 与 pin10 短接）：
 
 ```bash
-python3 - <<'PY'
+# 板上没装 python3-serial
+sudo apt install -y python3-serial     # 装前问用户
+sudo python3 - <<'PY'
 import serial, time
 p = serial.Serial("/dev/ttyHS2", 115200, timeout=1)
 p.write(b"hello40pin\r\n"); time.sleep(0.2)
@@ -189,11 +422,11 @@ print(repr(p.read(64))); p.close()
 PY
 ```
 
-没装 pyserial：
+不装包时的写法（`stty` + `cat`，全是系统自带工具）：
 
 ```bash
-stty -F /dev/ttyHS2 115200 raw -echo
-( cat /dev/ttyHS2 & ) ; printf 'hi\r\n' > /dev/ttyHS2 ; sleep 1 ; kill %1
+sudo stty -F /dev/ttyHS2 115200 raw -echo
+sudo sh -c 'timeout 2 cat /dev/ttyHS2 & sleep 0.3; printf "hi\r\n" > /dev/ttyHS2; wait'
 ```
 
 ## 6. PWM 与 ADC
@@ -255,10 +488,23 @@ PY
 
 ## 8. 实测记录
 
-- 2026-11-13，Debian 13 / kernel 6.6.116
+- 2026-11-13，Debian 13 / kernel 6.6.116，桌面用户 `p` 的组：`sudo audio video users input`
 - gpiochip：0(512-523) 1(524-533) 2(534-542) 3(543-546) **4(547-722, TLMM)** 5(723-737)
-- `/dev/i2c-9`、`/dev/spidev10.0`/`.1`、`/dev/ttyHS2` 均存在
+- **权限：`/dev/i2c-*` `/dev/gpiochip*` `/dev/spidev*` 全是 `root:root 600`**，
+  `p` 实测三个都 `PermissionError`；`/dev/ttyHS2` 是 `root:dialout 660` 但 `p` 不在 dialout
+  → **本节命令全部需要 sudo**
+- **`rgs`/`rgpiod`：服务 active、`go`/`i2co`/`share` 能返回句柄，
+  但 `gic`/`gil`/`gr`/`gso` 全部 `-93 EPERM`**（root 和 p 都一样，chip0/chip4 都一样，
+  放 `/permits` 后 `lcfg` 也不行）→ daemon 路径不可用
+- **lgpio 本地直连可用**（不经 daemon）：`lgGpiochipOpen(4)` → 0，
+  `gpio36 GetMode=65536(LG_SET_INPUT) read=1`，`gpio37 read=1`，`gpio38 read=0`；
+  编译：`gcc x.c -o x -l:liblgpio.so.1`（板内无 `lgpio.h`，需自声明原型）
+- **I2C 零安装可用**：用 `I2C_RDWR` 1-字节读探针扫到 `bus0:41`、`bus1:47`；
+  `bus3/9/13/16` 无应答（屏未接 / 40Pin 空 / DP AUX）
+- 零长写探针**会漏** LT9611UXD(0x41)，读探针不会 —— 扫描用读探针
+- `1-002c`(emc2303) 有驱动绑定但通用读探针不应答
 - PWM：`/sys/class/pwm/pwmchip0` npwm=4（PMIC PWM，非插针）
-- ADC：`iio:device1` 上 `pm7325_adc0/1/2`，实测 raw 值见上
-- `rgs` 存在（lgpio 1.0-r0），`rgs help` 报 unknown command，`rgs -h` 有输出
-- `i2cdetect`/`gpioset`/`python3-gpiod` 均未安装；`liblgpio.so.1` 存在但无 `.so` 软链
+- ADC：`iio:device1` 的 `pm7325_adc0/1/2`，实测 `0.604V / 0.563V / 0.000V`（悬空）
+- `i2cdetect`/`gpioset`/`python3-gpiod`/`python3-periphery`/`python3-serial`/`spidev`
+  均未安装；`liblgpio.so.1` 存在但无 `.so` 软链、无头文件；`gcc` 有
+- SPI：`/sys/bus/spi/devices/` 有 `spi10.0` `spi10.1`

@@ -73,6 +73,16 @@ cat /proc/mounts | grep -E 'sda|mmcblk'
 df -h / /var/persist /media/p/SDCARD
 ```
 
+> ★ **`/etc/fstab` 在这份镜像上是空的**（只有一行 `# UNCONFIGURED FSTAB FOR BASE SYSTEM`）。
+> 跑去 `cat /etc/fstab` 找挂载点会什么也看不到。一切都是 **systemd mount unit**：
+> ```bash
+> systemctl status var-persist.mount --no-pager
+> #   Where: /var/persist
+> #   What:  /dev/sda2
+> systemctl list-units --type=mount --no-pager
+> ```
+> 所以添永久挂载不是改 fstab，而是加 `.mount` 单元（或先问用户想用哪种方式）。
+
 ### 3.2 手工挂一个分区
 
 ```bash

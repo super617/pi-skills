@@ -88,8 +88,20 @@ sudo -u p env XDG_RUNTIME_DIR=/run/user/1001 \
 | 设默认输出 | `pactl set-default-sink X` | `wpctl set-default <id>` |
 | 音量 | `pactl set-sink-volume X 80%` | `wpctl set-volume <id> 0.8` |
 | 静音 | `pactl set-sink-mute X 1` | `wpctl set-mute <id> 1` |
+| 切端口 | `pactl set-sink-port` | `wpctl set-route <id> <index>` |
+| 切 profile | `pactl set-card-profile` | `wpctl set-profile <id> <index>` |
 | 播放文件 | `paplay x.oga` | `pw-play [--target <id>] x.oga` |
 | 录音 | `parec x.wav` | `pw-record x.wav` |
+
+`wpctl` 实测支持的全部子命令（`wpctl --help`）：
+
+```
+status  get-volume ID  inspect ID  set-default ID
+set-volume ID VOL[%][-/+]   set-mute ID 1|0|toggle
+set-profile ID INDEX        set-route ID INDEX
+clear-default [ID]          settings [KEY] [VAL]
+set-log-level [ID] LEVEL
+```
 
 ## 4. 切输出（扬声器 ↔ HDMI）
 

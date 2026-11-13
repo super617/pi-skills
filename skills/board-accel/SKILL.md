@@ -94,13 +94,27 @@ Backend = DSP
 ls /usr/lib/libQnnHtp.so
 ls /usr/lib/libQnnHtpV68*.so       # 本板是 V68
 ls /usr/lib/libQnnGenAiTransformer*.so
+strings /usr/lib/libQnnHtp.so | grep -E 'AISW_VERSION|^v2\.' | head -3
 ```
 
-实测存在 `libQnnHtpV68Stub.so` / `libQnnHtpV68CalculatorStub.so`，
-另外 V69/V73/V75/V79/V81 的 stub 也在（镜像通用打包，**只有 V68 能用**）。
+实测版本（2026-11-13）：
 
-`qnn-platform-validator` 实测加载的是
-`libQnnHtpV68CalculatorStub.so` → 确认后端是 **v68**。
+```
+AISW_VERSION: 2.47.0
+v2.47.0.260601114230
+```
+
+后端配置确认（`/usr/share/npu-llm/*/htp_backend_ext_config.json`）：
+
+```json
+{ "devices": [ { "soc_id": 35, "dsp_arch": "v68",
+                  "cores": [ { "core_id": 0, "perf_profile": "burst",
+                               "rpc_control_latency": 100 } ] } ],
+  "memory": { "mem_type": "shared_buffer" } }
+```
+
+`soc_id 35` + `dsp_arch v68` —— 这就是为什么**只有 V68 的 stub 能用**：
+镜像里虽然也带了 V69/V73/V75/V79/V81 的 stub，但那是通用打包。
 
 ### 3.4 跑推理
 
@@ -118,8 +132,17 @@ ls /usr/share/npu-llm/
 #   每个含 htp_backend_ext_config.json / model-config.json / models/ / tokenizer.json
 
 command -v npu-chat
-npu-chat --help             # 或直接跑，默认用 qwen
 ```
+
+> ⚠️ **`npu-chat` 是个 GTK 图形程序，不是命令行工具**。
+> 实测 `npu-chat --help` 在无显示环境会 `Gtk-CRITICAL ... GDK_IS_DISPLAY` 然后
+> `Traceback ... Gtk.ApplicationWindow` 崩掉。
+> 要用它必须从桌面图标启动，或在有会话变量的终端里：
+> ```bash
+> sudo -u p env XDG_RUNTIME_DIR=/run/user/1001 WAYLAND_DISPLAY=wayland-0 npu-chat
+> ```
+> 想在命令行验 NPU，用 `qnn-platform-validator --testBackend`（§3.2）或
+> `qnn-net-run`，不要用 `npu-chat`。
 
 ### 3.5 推理时看它到底在不在算
 
@@ -171,17 +194,75 @@ sudo ls /sys/kernel/debug/msm_vidc/
 # disable_video_syscache  enable_bugon
 ```
 
-### 4.4 硬解播放
+### 4.4 播放：先看清楚这块镜像上什么真能跑
+
+**结论先行：当前镜像上 GStreamer 硬解跑不起来，能用的是软解 `avdec_h264`。**
+这一点和旧 SDK 文档写的不一样（旧镜像能硬解），下面是本机实测。
+
+先确认两件事：
 
 ```bash
 export GST_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/gstreamer-1.0:/usr/lib/gstreamer-1.0
-gst-launch-1.0 -e filesrc location=/path/test.mp4 ! qtdemux ! h264parse \
-    ! v4l2h264dec capture-io-mode=5 output-io-mode=5 ! videoconvert ! autovideosink
+
+# 1) 解码器的输出格式（这是关键）
+v4l2-ctl -d /dev/video32 --list-formats
+#   [0]: 'Q08C' (QCOM Compressed 8-bit Format, compressed)   ← QCOM 私有
+#   [1]: 'NV12' [2]: 'NV21'
+
+# 2) 现在生效的 v4l2 插件是哪一个
+gst-inspect-1.0 v4l2h264dec | grep -E 'Filename|Version'
+#   Filename  /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstvideo4linux2.so
+#   Version   1.26.2        ← Debian 原版，不是 BSP 那份
 ```
 
-**没有软件解码器**（`avdec_h264` 缺失）。所以能看到画面，基本就说明走了硬解。
+实测错误：
 
-### 4.5 VA-API
+```
+$ gst-launch-1.0 filesrc location=/tmp/v.h264 ! h264parse ! v4l2h264dec ! fakesink
+ERROR: from element v4l2h264dec0: Video device uses an unsupported pixel format.
+streaming stopped, reason not-negotiated (-4)
+```
+
+根因：`/dev/video32` 的 capture 端要 QCOM 私有格式，而实际被加载的 `v4l2h264dec`
+是 Debian 1.26.2 原版插件（不认那些私有格式）。镜像里也没装 QCOM 自己的解码元素：
+
+```bash
+gst-inspect-1.0 | grep -iE 'c2d|qtivdec|vidcdec'
+# → 没有。qti 系列只有 qtivtransform / qtivcomposer / qtivoverlay / qtiqmmfsrc …
+```
+
+所以下面这些写法**都会失败**（不要拿去让用户试）：
+
+```
+v4l2h264dec ! fakesink                       → not-negotiated
+v4l2h264dec ! videoconvert ! autovideosink   → unsupported pixel format
+v4l2h264dec device=/dev/video32 ! ...        → 同上
+```
+
+### 4.5 能用的播放写法（软解）
+
+```bash
+export GST_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/gstreamer-1.0:/usr/lib/gstreamer-1.0
+
+# 文件是真 H.264 Annex-B 时（换 qtdemux 即可播 mp4）
+gst-launch-1.0 -e filesrc location=/tmp/v.h264 \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! h264parse \
+    ! avdec_h264 ! videoconvert ! autovideosink
+```
+
+实测软解基准（300 帧 1280×720，`fakesink`）：
+
+```
+soft avdec_h264 : wall=0.48s  user=1.39s  sys=0.13s  cpu=315%
+```
+
+> **踩过的坑：`h264parse` 会拒长度前缀（AVCC）文件。**
+> `x264enc` 直接 `! filesink` 写出的是 `00 00 00 02 09 10 …`（长度前缀），
+> `h264parse` 报 `No valid frames found before end of stream`。
+> 两种解法：编码端加 caps `video/x-h264,stream-format=byte-stream,alignment=au`，
+> 或解码端显式给同一组 caps。文件头是 `00 00 00 01` 才是 Annex-B。
+
+### 4.6 VA-API
 
 ```bash
 vainfo
@@ -196,16 +277,27 @@ root shell 里要先设显示变量，否则 `vainfo` 会走 x11 然后失败：
 LIBVA_DRIVER_NAME=msm XDG_RUNTIME_DIR=/run/user/1001 vainfo
 ```
 
-### 4.6 怎么证明真走了 VPU（关键判据）
+### 4.7 怎么证明真走了 VPU（判据）
+
+**前提：V4L2 那条路当前是断的（§4.4），所以现阶段没有可用的硬解链路可证明。**
+真要验证 VPU，按下面的判据，不能只看“画面出来了”：
 
 | 判据 | 做法 |
 |---|---|
-| Venus firmware 在日志里有流启动 | `sudo dmesg \| grep -i msm_vidc \| tail` |
-| CPU 占用没打满 | `top -b -n1 \| head -12`，解码 1080p30 时单核不该 100% |
-| 硬解插件被实际使用 | `GST_DEBUG=3 gst-launch-1.0 ...` 看选的是 `v4l2h264dec` |
-| `/dev/video32` 被打开 | `sudo lsof /dev/video32` |
+| Venus firmware 启动了流 | `sudo dmesg \| grep -i msm_vidc \| tail`，找 `CmdDec`：`264d` / `265d` |
+| 解码器被真打开 | `sudo lsof /dev/video32`（解码时应有进程持着） |
+| 格式协商成功 | `GST_DEBUG=v4l2*:4` 看有没有走到 `VIDIOC_S_FMT` |
+| CPU 不被打满 | `top -b -n1 \| head -12`；720p30 硬解不应吃掉多核 |
 
-只看到"画面出来了"**不能**证明是硬解。
+实测一次**失败**尝试留下的日志长这样（可用它反向确认走了哪个节点）：
+
+```
+msm_vidc: fw: <VFW_E:CmdDec:264d:...> vDec_SetSubscribeMode(4725):
+    Subscribe unsupported port 1 property 300017a
+```
+
+只要看到 `CmdDec` 就说明**进了解码器**（即使后面协商失败）；
+完全没这条，就是根本没到 VPU。
 
 ## 5. 环境变量（这块板上很关键）
 

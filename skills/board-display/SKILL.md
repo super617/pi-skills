@@ -163,16 +163,34 @@ export WAYLAND_DISPLAY=wayland-0
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
 ```
 
-## 8. 硬解播放（VPU）
+## 8. 视频播放
 
-板上有 `v4l2h264dec` / `v4l2h265dec`（Venus），**没有软件解码器**（`avdec_h264` 缺失）：
+**先看结论：这块镜像上 GStreamer 硬解跑不起来，用软件解码。**
+（旧 SDK 文档写的硬解管道能跑，那是旧镜像；本机实测不行，详见 `board-accel` §4.4）
+
+可用的写法：
 
 ```bash
-gst-launch-1.0 -e filesrc location=/home/p/test.mp4 ! qtdemux ! h264parse \
-    ! v4l2h264dec capture-io-mode=5 output-io-mode=5 ! videoconvert ! autovideosink
+export GST_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/gstreamer-1.0:/usr/lib/gstreamer-1.0
+
+# mp4
+sudo -u p env XDG_RUNTIME_DIR=/run/user/1001 WAYLAND_DISPLAY=wayland-0 \
+  GST_PLUGIN_PATH=$GST_PLUGIN_PATH \
+  gst-launch-1.0 -e filesrc location=/home/p/test.mp4 ! qtdemux ! h264parse \
+  ! avdec_h264 ! videoconvert ! autovideosink
 ```
 
-怎么证明真走了硬解、没偷偷软解 → 见 `board-accel`。
+不要用的写法（实测报 `unsupported pixel format` / `not-negotiated`）：
+
+```
+v4l2h264dec capture-io-mode=5 output-io-mode=5 ! videoconvert ! autovideosink
+```
+
+原因：`/dev/video32` 的 capture 端要 QCOM 私有格式（`Q08C`），
+而生效的 `v4l2h264dec` 是 Debian 原版 1.26.2 插件，不认那些格式。
+
+上屏 sink 选哪个、怎么确认桌面变量 → 见 §7；
+播放基线（720p300 帧软解 0.48s）与硬解判据 → 见 `board-accel`。
 
 ## 9. 已知坑
 

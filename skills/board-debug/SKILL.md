@@ -34,6 +34,41 @@ systemctl list-units --state=running --no-pager | head -30
 journalctl -b -p warning --no-pager | tail -50
 ```
 
+### 2.1 ★ 这几个 failed 是常态，不要去修
+
+本机实机 `systemctl --failed` 固定输出这 5 个：
+
+```
+● var-usbfw.mount                       failed   mount usb_fw unit
+● bt-autoconnect.service                failed   Reconnect paired Bluetooth audio devices
+● camx-v4l2-bridge@0.service           failed   Camx V4L2 Bridge for camera 0
+● gstd.service                         failed   GSTreamer Daemon
+● iptables-restore.service             failed   Restore iptables rules
+```
+
+| 单元 | 为什么失败 | 什么时候才真需要管 |
+|---|---|---|
+| `var-usbfw.mount` | USB 固件分区不存在 | 只有需要 USB 固件升级时 |
+| `bt-autoconnect` | 没配对过蓝牙音频设备 | 配过音频设备却不重连时 |
+| `camx-v4l2-bridge@0` | **没接摄像头模组** | 接了模组仍失败时（相机问题）|
+| `gstd` | GStreamer daemon 没配置 | 用到 gstd 的管道时 |
+| `iptables-restore` | 没有规则文件 | 真有自己的防火墙规则时 |
+
+→ 向用户报「系统有 5 个服务失败」之前先对这张表。把这几个当新故障追，
+等于把预期状态当 bug。
+
+### 2.2 崩机取证：pstore 不可用
+
+```bash
+ls /sys/fs/pstore/          # 实测: 不存在 → 没有 pstore 后端
+cat /proc/sys/kernel/panic  # 10（panic 后 10 秒重启）
+cat /proc/sys/kernel/sysrq  # 438
+```
+
+所以**上一次崩溃的 dmesg 拿不回来**（没 pstore/ramoops）。要抓 panic 只能：
+串口 console 常开、或事先 `journalctl -f` / `dmesg -w` 录到外部。
+下结论前先确认「能不能拿到上次的日志」，拿不到就直说。
+
 板上有几个关键单元，出问题先看它们的 `is-active`：
 
 ```bash
