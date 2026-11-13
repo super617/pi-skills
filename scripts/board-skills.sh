@@ -26,6 +26,15 @@ set -u
 
 REPO_SLUG="${PI_SKILLS_SLUG:-super617/pi-skills}"
 REPO_URL="${PI_SKILLS_REPO:-https://github.com/$REPO_SLUG}"
+
+# HOME is not guaranteed: a bare `adb shell` / serial root login can have no
+# HOME exported, and `set -u` would then kill the script before it prints
+# anything. Fall back to the passwd entry, then to /root.
+if [ -z "${HOME:-}" ]; then
+    HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+    [ -n "${HOME:-}" ] || HOME=/root
+    export HOME
+fi
 HOME_DIR="${PI_AGENT_HOME:-$HOME}"
 AGENT_DIR="$HOME_DIR/.pi/agent"
 SKILLS_DIR="$AGENT_DIR/skills"
