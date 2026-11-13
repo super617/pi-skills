@@ -261,12 +261,21 @@ do_prompt() {
 
     # A GUI dialog when there is a desktop session, a terminal question when
     # there is a tty, silence otherwise (cron, systemd, no session yet).
+    #
+    # The prompt's exit status *is* the answer (0 update, 1 later, 2 never), so
+    # only status 3 -- "no GTK here" -- may fall through to the terminal. Treating
+    # any non-zero status as "fall back" would ask a second time in a terminal
+    # right after the person clicked "稍后" in the dialog.
     if have python3 && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}${XDG_SESSION_TYPE:-}" ]; then
-        if python3 "$SCRIPT_DIR/board-skills-prompt.py" "$local_v" "$remote_v" 2>/dev/null; then
-            do_update
-            exit $?
-        fi
-        exit 0
+        python3 "$SCRIPT_DIR/board-skills-prompt.py" "$local_v" "$remote_v" 2>/dev/null
+        rc=$?
+        case "$rc" in
+            0) do_update; exit $? ;;
+            1) exit 0 ;;                      # later: ask again next login
+            2) state_put dismissed "\"$remote_v\"" 2>/dev/null || true
+               exit 0 ;;
+            *) : ;;                           # 3: no GTK, use the terminal
+        esac
     fi
 
     if [ -t 0 ] && [ -t 1 ]; then
